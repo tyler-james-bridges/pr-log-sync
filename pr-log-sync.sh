@@ -12,7 +12,15 @@ set -euo pipefail
 YEAR=$(date +%Y)
 VAULT_PATH="${VAULT_PATH:-$HOME/Documents/Obsidian Vault/$YEAR/Work/PR Log}"
 GITHUB_ORG="${GITHUB_ORG:-}"
-TEMP_DIR=$(mktemp -d) || { echo "Error: Failed to create temp directory"; exit 1; }
+# Security: Create temp directory with verification
+TEMP_DIR=$(mktemp -d -t pr-log-sync.XXXXXXXXXX) || { echo "Error: Failed to create temp directory"; exit 1; }
+
+# Verify temp directory is in expected location (macOS uses /var/folders, Linux uses /tmp)
+if [[ ! "$TEMP_DIR" =~ ^/tmp/ ]] && [[ ! "$TEMP_DIR" =~ ^/var/folders/ ]]; then
+    echo "Error: Temporary directory created in unexpected location: $TEMP_DIR"
+    rm -rf "$TEMP_DIR"
+    exit 1
+fi
 
 # Dependency checks
 check_dependencies() {
@@ -34,6 +42,80 @@ check_dependencies() {
 
 check_dependencies
 
+# Security: Validate GitHub organization name (alphanumeric, hyphens, underscores only)
+validate_github_org() {
+    local org="$1"
+    if [[ ! "$org" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        echo "Error: Invalid GitHub organization name '$org'. Only alphanumeric characters, hyphens, and underscores are allowed."
+        exit 1
+    fi
+    if [[ ${#org} -gt 39 ]]; then
+        echo "Error: GitHub organization name too long (max 39 characters)"
+        exit 1
+    fi
+}
+
+# Security: Validate vault path to prevent path traversal attacks
+validate_vault_path() {
+    local path="$1"
+
+    # Resolve to absolute path
+    local resolved_path
+    if [[ "$OSTYPE" == darwin* ]]; then
+        # macOS: Use python as fallback if realpath not available
+        resolved_path=$(cd "$path" 2>/dev/null && pwd -P || python3 -c "import os; print(os.path.realpath('$path'))" 2>/dev/null || echo "$path")
+    else
+        resolved_path=$(realpath -m "$path" 2>/dev/null || readlink -f "$path" 2>/dev/null || echo "$path")
+    fi
+
+    # Check for symlink at the path itself
+    if [[ -L "$path" ]]; then
+        echo "Error: Vault path cannot be a symbolic link: $path"
+        exit 1
+    fi
+
+    # Ensure path is under user's home directory
+    if [[ ! "$resolved_path" =~ ^"$HOME" ]]; then
+        echo "Error: Vault path must be within your home directory for security"
+        echo "  Provided: $path"
+        echo "  Resolved: $resolved_path"
+        echo "  Home: $HOME"
+        exit 1
+    fi
+
+    # Return the resolved path
+    echo "$resolved_path"
+}
+
+# Security: Sanitize strings for safe use in shell and markdown
+# Removes/escapes characters that could cause command injection
+sanitize_string() {
+    local input="$1"
+    # Remove null bytes, escape backticks, dollar signs, and backslashes
+    # These are the primary shell injection vectors
+    printf '%s' "$input" | tr -d '\0' | sed 's/[`$\\]/\\&/g'
+}
+
+# Security: Sanitize strings for markdown table cells
+# Escapes pipe characters and removes dangerous content
+sanitize_for_markdown() {
+    local input="$1"
+    # First sanitize for shell safety, then escape markdown pipes
+    local sanitized
+    sanitized=$(sanitize_string "$input")
+    # Escape pipe characters for markdown tables, remove newlines
+    printf '%s' "$sanitized" | tr -d '\n\r' | sed 's/|/\\|/g'
+}
+
+# Security: Check if a path is a symlink (TOCTOU protection)
+reject_if_symlink() {
+    local path="$1"
+    if [[ -L "$path" ]]; then
+        echo "Error: Refusing to operate on symbolic link: $path"
+        exit 1
+    fi
+}
+
 # Terminal colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -54,9 +136,25 @@ get_date_days_ago() {
 
 validate_date() {
     local date_str="$1"
+
+    # Check format first (strict regex)
     if [[ ! "$date_str" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
         echo "Error: Invalid date format '$date_str'. Use YYYY-MM-DD"
         exit 1
+    fi
+
+    # Security: Verify it's an actual valid calendar date (not just well-formatted)
+    # This prevents potential issues with date command processing
+    if [[ "$OSTYPE" == darwin* ]]; then
+        if ! date -j -f "%Y-%m-%d" "$date_str" "+%Y-%m-%d" >/dev/null 2>&1; then
+            echo "Error: Invalid date '$date_str'. Please use a valid calendar date."
+            exit 1
+        fi
+    else
+        if ! date -d "$date_str" "+%Y-%m-%d" >/dev/null 2>&1; then
+            echo "Error: Invalid date '$date_str'. Please use a valid calendar date."
+            exit 1
+        fi
     fi
 }
 
@@ -65,9 +163,13 @@ FROM_DATE=$(get_date_days_ago 7)
 TO_DATE=$(date +%Y-%m-%d)
 DRY_RUN=false
 
-# Cleanup on exit
+# Cleanup on exit (with security verification)
 cleanup() {
-    rm -rf "$TEMP_DIR"
+    # Security: Only delete if TEMP_DIR looks like a temp directory we created
+    if [[ -n "$TEMP_DIR" ]] && [[ -d "$TEMP_DIR" ]] && \
+       [[ "$TEMP_DIR" =~ ^(/tmp/|/var/folders/).*pr-log-sync\. ]]; then
+        rm -rf "$TEMP_DIR"
+    fi
 }
 trap cleanup EXIT
 
@@ -137,12 +239,18 @@ if [ -z "$GITHUB_ORG" ]; then
     exit 1
 fi
 
-# Validate vault path
+# Security: Validate GitHub organization name
+validate_github_org "$GITHUB_ORG"
+
+# Validate and secure vault path
 if [ ! -d "$VAULT_PATH" ]; then
     echo "Warning: Vault path does not exist: $VAULT_PATH"
     echo "Creating directory..."
     mkdir -p "$VAULT_PATH" || { echo "Error: Failed to create vault path"; exit 1; }
 fi
+
+# Security: Validate vault path is safe (under $HOME, not a symlink)
+VAULT_PATH=$(validate_vault_path "$VAULT_PATH")
 
 echo -e "${BLUE}PR Log Sync${NC}"
 echo -e "Date range: ${GREEN}$FROM_DATE${NC} to ${GREEN}$TO_DATE${NC}"
@@ -159,13 +267,20 @@ get_month_file() {
     echo "${month_num}-${month_name}.md"
 }
 
-# Check if URL already exists in file
+# Check if URL already exists in file (with security checks)
 url_exists_in_file() {
     local file="$1"
     local url="$2"
 
-    if [ -f "$file" ]; then
-        grep -q "$url" "$file" && return 0
+    # Security: Reject symlinks (TOCTOU protection)
+    if [[ -L "$file" ]]; then
+        echo "Error: Refusing to operate on symbolic link: $file" >&2
+        exit 1
+    fi
+
+    if [[ -f "$file" ]]; then
+        # Security: Use -F for fixed string matching (prevents regex injection)
+        grep -qF "$url" "$file" && return 0
     fi
     return 1
 }
@@ -253,26 +368,32 @@ while read -r pr_json; do
 
     [ -z "$repo" ] || [ "$repo" = "null" ] && continue
 
+    # Security: Sanitize all user-controlled content from GitHub API
+    repo=$(sanitize_for_markdown "$repo")
+    title=$(sanitize_for_markdown "$title")
+    # URL should only contain safe characters, but sanitize anyway
+    url=$(sanitize_string "$url")
+
     month_file=$(get_month_file "$date")
     full_path="$VAULT_PATH/$month_file"
 
     # Skip if already exists
     if url_exists_in_file "$full_path" "$url"; then
-        echo -e "${YELLOW}  Skipping (exists):${NC} $title"
+        printf '%b  Skipping (exists):%b %s\n' "${YELLOW}" "${NC}" "$title"
         continue
     fi
 
-    # Build table row
+    # Build table row (using printf for safety)
     pr_row="| $date | $repo | [$title]($url) | $status |"
 
     if [ "$status" = "merged" ]; then
-        echo -e "${GREEN}  + $repo:${NC} $title"
+        printf '%b  + %s:%b %s\n' "${GREEN}" "$repo" "${NC}" "$title"
     else
-        echo -e "${RED}  + $repo:${NC} $title (closed)"
+        printf '%b  + %s:%b %s (closed)\n' "${RED}" "$repo" "${NC}" "$title"
     fi
 
     # Write to temp files (grouped by month)
-    echo "$pr_row" >> "$TEMP_DIR/${month_file}.prs"
+    printf '%s\n' "$pr_row" >> "$TEMP_DIR/${month_file}.prs"
 done <<< "$ALL_PRS"
 
 # ============================================
@@ -292,22 +413,28 @@ while read -r pr_json; do
 
     [ -z "$repo" ] || [ "$repo" = "null" ] && continue
 
+    # Security: Sanitize all user-controlled content from GitHub API
+    repo=$(sanitize_for_markdown "$repo")
+    title=$(sanitize_for_markdown "$title")
+    url=$(sanitize_string "$url")
+    author=$(sanitize_for_markdown "$author")
+
     month_file=$(get_month_file "$date")
     full_path="$VAULT_PATH/$month_file"
 
     # Skip if already exists
     if url_exists_in_file "$full_path" "$url"; then
-        echo -e "${YELLOW}  Skipping (exists):${NC} $title"
+        printf '%b  Skipping (exists):%b %s\n' "${YELLOW}" "${NC}" "$title"
         continue
     fi
 
-    # Build table row for reviews
+    # Build table row for reviews (using printf for safety)
     review_row="| $date | $repo | [$title]($url) | @$author |"
 
-    echo -e "${CYAN}  + reviewed $repo:${NC} $title (by @$author)"
+    printf '%b  + reviewed %s:%b %s (by @%s)\n' "${CYAN}" "$repo" "${NC}" "$title" "$author"
 
     # Write to temp files (grouped by month)
-    echo "$review_row" >> "$TEMP_DIR/${month_file}.reviews"
+    printf '%s\n' "$review_row" >> "$TEMP_DIR/${month_file}.reviews"
 done <<< "$REVIEWED_PRS"
 
 echo ""
@@ -351,6 +478,12 @@ else
     for month_file in $ALL_MONTHS; do
         full_path="$VAULT_PATH/$month_file"
 
+        # Security: Check for symlink attacks before any file operations
+        if [[ -e "$full_path" ]] && [[ -L "$full_path" ]]; then
+            echo "Error: Refusing to operate on symbolic link: $full_path" >&2
+            exit 1
+        fi
+
         # Create new file if needed
         if [ ! -f "$full_path" ]; then
             echo -e "${YELLOW}Creating new file:${NC} $month_file"
@@ -388,52 +521,65 @@ EOF
         fi
 
         # Ensure Code Reviews section exists
-        if ! grep -q "## Code Reviews" "$full_path"; then
+        # Security: Use -qF for fixed string matching (prevents regex injection)
+        if ! grep -qF "## Code Reviews" "$full_path"; then
             # Insert Code Reviews section before Related Project Notes
-            if grep -q "## Related Project Notes" "$full_path"; then
-                line_num=$(grep -n "## Related Project Notes" "$full_path" | cut -d: -f1)
-                head -n $((line_num - 1)) "$full_path" > "${full_path}.tmp"
-                echo "" >> "${full_path}.tmp"
-                echo "## Code Reviews" >> "${full_path}.tmp"
-                echo "" >> "${full_path}.tmp"
-                echo "| Date | Repo | Title | Author |" >> "${full_path}.tmp"
-                echo "|------|------|-------|--------|" >> "${full_path}.tmp"
-                echo "" >> "${full_path}.tmp"
-                tail -n +$line_num "$full_path" >> "${full_path}.tmp"
-                mv "${full_path}.tmp" "$full_path"
+            if grep -qF "## Related Project Notes" "$full_path"; then
+                line_num=$(grep -nF "## Related Project Notes" "$full_path" | head -1 | cut -d: -f1)
+                # Security: Validate line number
+                if [[ "$line_num" =~ ^[0-9]+$ ]] && [ "$line_num" -ge 1 ]; then
+                    head -n $((line_num - 1)) "$full_path" > "${full_path}.tmp"
+                    echo "" >> "${full_path}.tmp"
+                    echo "## Code Reviews" >> "${full_path}.tmp"
+                    echo "" >> "${full_path}.tmp"
+                    echo "| Date | Repo | Title | Author |" >> "${full_path}.tmp"
+                    echo "|------|------|-------|--------|" >> "${full_path}.tmp"
+                    echo "" >> "${full_path}.tmp"
+                    tail -n +$line_num "$full_path" >> "${full_path}.tmp"
+                    mv "${full_path}.tmp" "$full_path"
+                fi
             fi
         fi
 
         # Insert PRs if we have any for this month
         pr_file="$TEMP_DIR/${month_file}.prs"
         if [ -f "$pr_file" ]; then
-            if grep -q "## Code Reviews" "$full_path"; then
-                line_num=$(grep -n "## Code Reviews" "$full_path" | cut -d: -f1)
-                head -n $((line_num - 1)) "$full_path" > "${full_path}.tmp"
-                cat "$pr_file" >> "${full_path}.tmp"
-                echo "" >> "${full_path}.tmp"
-                tail -n +$line_num "$full_path" >> "${full_path}.tmp"
-                mv "${full_path}.tmp" "$full_path"
-            elif grep -q "## Related Project Notes" "$full_path"; then
-                line_num=$(grep -n "## Related Project Notes" "$full_path" | cut -d: -f1)
-                head -n $((line_num - 1)) "$full_path" > "${full_path}.tmp"
-                cat "$pr_file" >> "${full_path}.tmp"
-                echo "" >> "${full_path}.tmp"
-                tail -n +$line_num "$full_path" >> "${full_path}.tmp"
-                mv "${full_path}.tmp" "$full_path"
+            if grep -qF "## Code Reviews" "$full_path"; then
+                line_num=$(grep -nF "## Code Reviews" "$full_path" | head -1 | cut -d: -f1)
+                # Security: Validate line number
+                if [[ "$line_num" =~ ^[0-9]+$ ]] && [ "$line_num" -ge 1 ]; then
+                    head -n $((line_num - 1)) "$full_path" > "${full_path}.tmp"
+                    cat "$pr_file" >> "${full_path}.tmp"
+                    echo "" >> "${full_path}.tmp"
+                    tail -n +$line_num "$full_path" >> "${full_path}.tmp"
+                    mv "${full_path}.tmp" "$full_path"
+                fi
+            elif grep -qF "## Related Project Notes" "$full_path"; then
+                line_num=$(grep -nF "## Related Project Notes" "$full_path" | head -1 | cut -d: -f1)
+                # Security: Validate line number
+                if [[ "$line_num" =~ ^[0-9]+$ ]] && [ "$line_num" -ge 1 ]; then
+                    head -n $((line_num - 1)) "$full_path" > "${full_path}.tmp"
+                    cat "$pr_file" >> "${full_path}.tmp"
+                    echo "" >> "${full_path}.tmp"
+                    tail -n +$line_num "$full_path" >> "${full_path}.tmp"
+                    mv "${full_path}.tmp" "$full_path"
+                fi
             fi
         fi
 
         # Insert reviews if we have any for this month
         review_file="$TEMP_DIR/${month_file}.reviews"
         if [ -f "$review_file" ]; then
-            if grep -q "## Related Project Notes" "$full_path"; then
-                line_num=$(grep -n "## Related Project Notes" "$full_path" | cut -d: -f1)
-                head -n $((line_num - 1)) "$full_path" > "${full_path}.tmp"
-                cat "$review_file" >> "${full_path}.tmp"
-                echo "" >> "${full_path}.tmp"
-                tail -n +$line_num "$full_path" >> "${full_path}.tmp"
-                mv "${full_path}.tmp" "$full_path"
+            if grep -qF "## Related Project Notes" "$full_path"; then
+                line_num=$(grep -nF "## Related Project Notes" "$full_path" | head -1 | cut -d: -f1)
+                # Security: Validate line number
+                if [[ "$line_num" =~ ^[0-9]+$ ]] && [ "$line_num" -ge 1 ]; then
+                    head -n $((line_num - 1)) "$full_path" > "${full_path}.tmp"
+                    cat "$review_file" >> "${full_path}.tmp"
+                    echo "" >> "${full_path}.tmp"
+                    tail -n +$line_num "$full_path" >> "${full_path}.tmp"
+                    mv "${full_path}.tmp" "$full_path"
+                fi
             fi
         fi
 
