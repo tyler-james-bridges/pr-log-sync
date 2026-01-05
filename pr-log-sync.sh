@@ -10,7 +10,7 @@ set -euo pipefail
 
 # Configuration (override via environment variables)
 YEAR=$(date +%Y)
-VAULT_PATH="${VAULT_PATH:-$HOME/Documents/Obsidian Vault/$YEAR/PR Log}"
+VAULT_PATH="${VAULT_PATH:-$HOME/Documents/Obsidian Vault/$YEAR/Work/PR Log}"
 GITHUB_ORG="${GITHUB_ORG:-}"
 TEMP_DIR=$(mktemp -d) || { echo "Error: Failed to create temp directory"; exit 1; }
 
