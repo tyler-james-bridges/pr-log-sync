@@ -22,7 +22,7 @@ Sync your GitHub pull requests and code reviews to Obsidian markdown files. Gene
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/pr-log-sync.git
+git clone https://github.com/tyler-james-bridges/pr-log-sync.git
 
 # Make the script executable
 chmod +x pr-log-sync/pr-log-sync.sh

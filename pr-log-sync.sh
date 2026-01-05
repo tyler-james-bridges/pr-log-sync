@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # PR Log Sync - Sync GitHub PRs and code reviews to Obsidian markdown files
-# https://github.com/YOUR_USERNAME/pr-log-sync
+# https://github.com/tyler-james-bridges/pr-log-sync
 #
 # Generates monthly PR log files for tracking your contributions and code reviews.
 # Run with --help for usage information.
