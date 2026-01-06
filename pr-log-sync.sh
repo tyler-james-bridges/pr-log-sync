@@ -256,6 +256,27 @@ insert_before_section() {
     fi
 }
 
+# Update summary statistics in a month file
+update_summary() {
+    local file="$1"
+
+    # Count PRs by status (last column in PR table rows)
+    local merged=$(grep -E '^\| [0-9]{4}-[0-9]{2}-[0-9]{2} \|.*\| merged \|$' "$file" | wc -l | tr -d ' ')
+    local closed=$(grep -E '^\| [0-9]{4}-[0-9]{2}-[0-9]{2} \|.*\| closed \|$' "$file" | wc -l | tr -d ' ')
+    local open=$(grep -E '^\| [0-9]{4}-[0-9]{2}-[0-9]{2} \|.*\| open \|$' "$file" | wc -l | tr -d ' ')
+    local total=$((merged + closed + open))
+
+    # Count reviews (rows in Code Reviews section - look for @author pattern)
+    local reviews=$(grep -E '^\| [0-9]{4}-[0-9]{2}-[0-9]{2} \|.*\| @' "$file" | wc -l | tr -d ' ')
+
+    # Update the summary table using sed
+    sed -i '' "s/| \*\*Total PRs\*\* | [0-9]* |/| **Total PRs** | $total |/" "$file"
+    sed -i '' "s/| \*\*Merged\*\* | [0-9]* |/| **Merged** | $merged |/" "$file"
+    sed -i '' "s/| \*\*Closed\*\* | [0-9]* |/| **Closed** | $closed |/" "$file"
+    sed -i '' "s/| \*\*Open\*\* | [0-9]* |/| **Open** | $open |/" "$file"
+    sed -i '' "s/| \*\*Reviews\*\* | [0-9]* |/| **Reviews** | $reviews |/" "$file"
+}
+
 if [[ "$DRY_RUN" = true ]]; then
     echo "DRY RUN - Changes that would be made:"
     for pr_file in "$TEMP_DIR"/*.prs; do
@@ -296,6 +317,9 @@ else
         if [[ -f "$TEMP_DIR/${month_file}.reviews" ]]; then
             insert_before_section "$full_path" "## Related Project Notes" "$(cat "$TEMP_DIR/${month_file}.reviews")"
         fi
+
+        # Update summary statistics
+        update_summary "$full_path"
 
         echo "Updated: $month_file"
     done
