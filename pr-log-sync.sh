@@ -275,7 +275,7 @@ else
     shopt -s nullglob
     all_temp_files=("$TEMP_DIR"/*.prs "$TEMP_DIR"/*.reviews)
     shopt -u nullglob
-    months=$(printf '%s\n' "${all_temp_files[@]}" | xargs -n1 basename 2>/dev/null | sed 's/\.\(prs\|reviews\)$//' | sort -u)
+    months=$(printf '%s\n' "${all_temp_files[@]}" | xargs -n1 basename 2>/dev/null | sed -E 's/\.(prs|reviews)$//' | sort -u)
 
     for month_file in $months; do
         full_path="$VAULT_PATH/$month_file"
