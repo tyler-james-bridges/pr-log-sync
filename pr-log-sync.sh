@@ -109,12 +109,19 @@ CLOSED_PRS=$(gh search prs --author=@me --owner="$GITHUB_ORG" --state=closed --c
     --limit=100 --json repository,title,url,closedAt,state \
     --jq '.[] | select(.state != "merged") | {repo: .repository.name, title: .title, url: .url, date: (.closedAt | split("T")[0]), status: "closed"}' 2>/dev/null || echo "")
 
+# Fetch open PRs (created within date range)
+OPEN_PRS=$(gh search prs --author=@me --owner="$GITHUB_ORG" --state=open --created="${FROM_DATE}..${TO_DATE}" \
+    --limit=100 --json repository,title,url,createdAt \
+    --jq '.[] | {repo: .repository.name, title: .title, url: .url, date: (.createdAt | split("T")[0]), status: "open"}' 2>/dev/null || echo "")
+
 ALL_PRS="${MERGED_PRS}
-${CLOSED_PRS}"
+${CLOSED_PRS}
+${OPEN_PRS}"
 
 merged_count=$(echo "$MERGED_PRS" | grep -c '"status"' || true)
 closed_count=$(echo "$CLOSED_PRS" | grep -c '"status"' || true)
-echo "  Found $merged_count merged and $closed_count closed PRs"
+open_count=$(echo "$OPEN_PRS" | grep -c '"status"' || true)
+echo "  Found $merged_count merged, $closed_count closed, and $open_count open PRs"
 
 # Fetch code reviews (PRs you reviewed but didn't author)
 echo "Fetching your code reviews..."
@@ -216,6 +223,7 @@ create_month_file() {
 | **Total PRs** | 0 |
 | **Merged** | 0 |
 | **Closed** | 0 |
+| **Open** | 0 |
 | **Reviews** | 0 |
 
 ## PRs
