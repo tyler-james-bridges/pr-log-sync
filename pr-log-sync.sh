@@ -154,6 +154,11 @@ REVIEWED_PRS=$(gh search prs --reviewed-by=@me --owner="$GITHUB_ORG" --merged --
     --limit=100 --json repository,title,url,closedAt,author \
     --jq '.[] | {repo: .repository.name, title: .title, url: .url, date: (.closedAt | split("T")[0]), author: .author.login}' 2>/dev/null || echo "")
 
+# Fetch pending reviews (open PRs you reviewed but didn't author)
+PENDING_REVIEWS_RAW=$(gh search prs --reviewed-by=@me --owner="$GITHUB_ORG" --state=open \
+    --limit=100 --json repository,title,url,updatedAt,author \
+    --jq '.[] | {repo: .repository.name, title: .title, url: .url, date: (.updatedAt | split("T")[0]), author: .author.login}' 2>/dev/null || echo "")
+
 # Filter out PRs authored by self
 MY_LOGIN=$(gh api user --jq '.login' 2>/dev/null || echo "")
 if [[ -n "$MY_LOGIN" ]]; then
@@ -162,10 +167,18 @@ if [[ -n "$MY_LOGIN" ]]; then
         author=$(echo "$line" | jq -r '.author // empty')
         [[ "$author" != "$MY_LOGIN" ]] && echo "$line"
     done)
+    PENDING_REVIEWS=$(echo "$PENDING_REVIEWS_RAW" | while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        author=$(echo "$line" | jq -r '.author // empty')
+        [[ "$author" != "$MY_LOGIN" ]] && echo "$line"
+    done)
+else
+    PENDING_REVIEWS="$PENDING_REVIEWS_RAW"
 fi
 
 review_count=$(echo "$REVIEWED_PRS" | grep -c '"repo"' || true)
-echo "  Found $review_count code reviews"
+pending_review_count=$(echo "$PENDING_REVIEWS" | grep -c '"repo"' || true)
+echo "  Found $review_count code reviews, $pending_review_count pending reviews"
 echo ""
 
 # Process authored PRs
@@ -250,6 +263,32 @@ while IFS= read -r pr_json; do
     echo "$update_row" >> "$TEMP_DIR/${month_file}.updates"
 done <<< "$UPDATED_PRS"
 
+# Process pending reviews
+echo ""
+echo "Processing pending reviews..."
+while IFS= read -r pr_json; do
+    [[ -z "$pr_json" || "$pr_json" != "{"* ]] && continue
+
+    repo=$(echo "$pr_json" | jq -r '.repo')
+    title=$(echo "$pr_json" | jq -r '.title')
+    url=$(echo "$pr_json" | jq -r '.url')
+    date=$(echo "$pr_json" | jq -r '.date')
+    author=$(echo "$pr_json" | jq -r '.author')
+
+    [[ -z "$repo" || "$repo" = "null" ]] && continue
+
+    month_file=$(get_month_file "$date")
+    full_path="$VAULT_PATH/$month_file"
+
+    # Skip if URL already exists in file
+    [[ -f "$full_path" ]] && grep -qF "$url" "$full_path" && { echo "  Skipping (exists): $title"; continue; }
+
+    title=$(escape_markdown "$title")
+    pending_row="| $date | $repo | [$title]($url) | @$author |"
+    echo "  + pending review $repo: $title (by @$author)"
+    echo "$pending_row" >> "$TEMP_DIR/${month_file}.pending"
+done <<< "$PENDING_REVIEWS"
+
 echo ""
 
 # Check if any changes to make
@@ -257,9 +296,10 @@ shopt -s nullglob
 pr_files=("$TEMP_DIR"/*.prs)
 review_files=("$TEMP_DIR"/*.reviews)
 update_files=("$TEMP_DIR"/*.updates)
+pending_files=("$TEMP_DIR"/*.pending)
 shopt -u nullglob
 
-if [[ ${#pr_files[@]} -eq 0 && ${#review_files[@]} -eq 0 && ${#update_files[@]} -eq 0 ]]; then
+if [[ ${#pr_files[@]} -eq 0 && ${#review_files[@]} -eq 0 && ${#update_files[@]} -eq 0 && ${#pending_files[@]} -eq 0 ]]; then
     echo "No new PRs, updates, or reviews to add"
     exit 0
 fi
@@ -283,6 +323,7 @@ create_month_file() {
 | **Open** | 0 |
 | **PR Updates** | 0 |
 | **Reviews** | 0 |
+| **Pending Reviews** | 0 |
 
 ## PRs
 
@@ -295,6 +336,11 @@ create_month_file() {
 |------|------|-------|--------|
 
 ## Code Reviews
+
+| Date | Repo | Title | Author |
+|------|------|-------|--------|
+
+## Pending Reviews
 
 | Date | Repo | Title | Author |
 |------|------|-------|--------|
@@ -332,8 +378,11 @@ update_summary() {
     # Count PR updates (rows in PR Updates section - look for "Continued work" pattern)
     local pr_updates=$(grep -E '^\| [0-9]{4}-[0-9]{2}-[0-9]{2} \|.*\| Continued work \|$' "$file" | wc -l | tr -d ' ')
 
-    # Count reviews (rows in Code Reviews section - look for @author pattern)
-    local reviews=$(grep -E '^\| [0-9]{4}-[0-9]{2}-[0-9]{2} \|.*\| @' "$file" | wc -l | tr -d ' ')
+    # Count reviews (rows in Code Reviews section only - between "## Code Reviews" and "## Pending Reviews")
+    local reviews=$(sed -n '/^## Code Reviews$/,/^## Pending Reviews$/p' "$file" | grep -E '^\| [0-9]{4}-[0-9]{2}-[0-9]{2} \|.*\| @' | wc -l | tr -d ' ')
+
+    # Count pending reviews (rows in Pending Reviews section - between "## Pending Reviews" and "## Related Project Notes")
+    local pending_reviews=$(sed -n '/^## Pending Reviews$/,/^## Related Project Notes$/p' "$file" | grep -E '^\| [0-9]{4}-[0-9]{2}-[0-9]{2} \|.*\| @' | wc -l | tr -d ' ')
 
     # Update the summary table using sed
     sed_inplace "s/| \*\*Total PRs\*\* | [0-9]* |/| **Total PRs** | $total |/" "$file"
@@ -342,6 +391,7 @@ update_summary() {
     sed_inplace "s/| \*\*Open\*\* | [0-9]* |/| **Open** | $open |/" "$file"
     sed_inplace "s/| \*\*PR Updates\*\* | [0-9]* |/| **PR Updates** | $pr_updates |/" "$file"
     sed_inplace "s/| \*\*Reviews\*\* | [0-9]* |/| **Reviews** | $reviews |/" "$file"
+    sed_inplace "s/| \*\*Pending Reviews\*\* | [0-9]* |/| **Pending Reviews** | $pending_reviews |/" "$file"
 }
 
 if [[ "$DRY_RUN" = true ]]; then
@@ -364,12 +414,18 @@ if [[ "$DRY_RUN" = true ]]; then
         echo "$(basename "$review_file" .reviews) - Reviews:"
         cat "$review_file"
     done
+    for pending_file in "$TEMP_DIR"/*.pending; do
+        [[ -f "$pending_file" ]] || continue
+        echo ""
+        echo "$(basename "$pending_file" .pending) - Pending Reviews:"
+        cat "$pending_file"
+    done
 else
     # Get unique months (use nullglob to handle missing file types)
     shopt -s nullglob
-    all_temp_files=("$TEMP_DIR"/*.prs "$TEMP_DIR"/*.updates "$TEMP_DIR"/*.reviews)
+    all_temp_files=("$TEMP_DIR"/*.prs "$TEMP_DIR"/*.updates "$TEMP_DIR"/*.reviews "$TEMP_DIR"/*.pending)
     shopt -u nullglob
-    months=$(printf '%s\n' "${all_temp_files[@]}" | xargs -n1 basename 2>/dev/null | sed -E 's/\.(prs|updates|reviews)$//' | sort -u)
+    months=$(printf '%s\n' "${all_temp_files[@]}" | xargs -n1 basename 2>/dev/null | sed -E 's/\.(prs|updates|reviews|pending)$//' | sort -u)
 
     for month_file in $months; do
         full_path="$VAULT_PATH/$month_file"
@@ -391,9 +447,14 @@ else
             insert_before_section "$full_path" "## Code Reviews" "$(cat "$TEMP_DIR/${month_file}.updates")"
         fi
 
-        # Insert reviews before Related Project Notes section
+        # Insert reviews before Pending Reviews section
         if [[ -f "$TEMP_DIR/${month_file}.reviews" ]]; then
-            insert_before_section "$full_path" "## Related Project Notes" "$(cat "$TEMP_DIR/${month_file}.reviews")"
+            insert_before_section "$full_path" "## Pending Reviews" "$(cat "$TEMP_DIR/${month_file}.reviews")"
+        fi
+
+        # Insert pending reviews before Related Project Notes section
+        if [[ -f "$TEMP_DIR/${month_file}.pending" ]]; then
+            insert_before_section "$full_path" "## Related Project Notes" "$(cat "$TEMP_DIR/${month_file}.pending")"
         fi
 
         # Update summary statistics
