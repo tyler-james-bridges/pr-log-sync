@@ -154,8 +154,8 @@ REVIEWED_PRS=$(gh search prs --reviewed-by=@me --owner="$GITHUB_ORG" --merged --
     --limit=100 --json repository,title,url,closedAt,author \
     --jq '.[] | {repo: .repository.name, title: .title, url: .url, date: (.closedAt | split("T")[0]), author: .author.login}' 2>/dev/null || echo "")
 
-# Fetch pending reviews (open PRs you reviewed but didn't author)
-PENDING_REVIEWS_RAW=$(gh search prs --reviewed-by=@me --owner="$GITHUB_ORG" --state=open \
+# Fetch pending reviews (open PRs you reviewed but didn't author, updated in date range)
+PENDING_REVIEWS_RAW=$(gh search prs --reviewed-by=@me --owner="$GITHUB_ORG" --state=open --updated="${FROM_DATE}..${TO_DATE}" \
     --limit=100 --json repository,title,url,updatedAt,author \
     --jq '.[] | {repo: .repository.name, title: .title, url: .url, date: (.updatedAt | split("T")[0]), author: .author.login}' 2>/dev/null || echo "")
 
@@ -165,12 +165,12 @@ if [[ -n "$MY_LOGIN" ]]; then
     REVIEWED_PRS=$(echo "$REVIEWED_PRS" | while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         author=$(echo "$line" | jq -r '.author // empty')
-        [[ "$author" != "$MY_LOGIN" ]] && echo "$line"
+        [[ "$author" != "$MY_LOGIN" ]] && echo "$line" || true
     done)
     PENDING_REVIEWS=$(echo "$PENDING_REVIEWS_RAW" | while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         author=$(echo "$line" | jq -r '.author // empty')
-        [[ "$author" != "$MY_LOGIN" ]] && echo "$line"
+        [[ "$author" != "$MY_LOGIN" ]] && echo "$line" || true
     done)
 else
     PENDING_REVIEWS="$PENDING_REVIEWS_RAW"
