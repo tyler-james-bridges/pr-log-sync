@@ -1,60 +1,48 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # PR Log Sync - Sync GitHub PRs and code reviews to Obsidian markdown files
 # https://github.com/tyler-james-bridges/pr-log-sync
 #
-# Generates monthly PR log files for tracking your contributions and code reviews.
-# Run with --help for usage information.
 
 set -euo pipefail
 
-# Configuration
 YEAR=$(date +%Y)
 VAULT_PATH="${VAULT_PATH:-$HOME/Documents/Obsidian Vault/$YEAR/Work/PR Log}"
 GITHUB_ORG="${GITHUB_ORG:-}"
 TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
-# Check dependencies
+if [[ "$(uname)" == "Darwin" ]]; then
+    SED_INPLACE=(sed -i '')
+else
+    SED_INPLACE=(sed -i)
+fi
+
 command -v gh >/dev/null 2>&1 || { echo "Error: gh (GitHub CLI) required"; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "Error: jq required"; exit 1; }
 gh auth status >/dev/null 2>&1 || { echo "Error: GitHub CLI not authenticated. Run: gh auth login"; exit 1; }
 
-# Cross-platform date helper
 date_days_ago() {
     local days=$1
     date -v-${days}d +%Y-%m-%d 2>/dev/null || date -d "${days} days ago" +%Y-%m-%d
 }
 
-# Get month file name from date
-get_month_file() {
+month_file_for_date() {
     local d="$1"
-    local month_num month_name
-    month_num=$(date -j -f "%Y-%m-%d" "$d" "+%m" 2>/dev/null || date -d "$d" "+%m")
-    month_name=$(date -j -f "%Y-%m-%d" "$d" "+%B" 2>/dev/null || date -d "$d" "+%B")
-    echo "${month_num}-${month_name}.md"
+    local m n
+    m=$(date -j -f "%Y-%m-%d" "$d" "+%m" 2>/dev/null || date -d "$d" "+%m")
+    n=$(date -j -f "%Y-%m-%d" "$d" "+%B" 2>/dev/null || date -d "$d" "+%B")
+    echo "${m}-${n}.md"
 }
 
-# Escape pipes for markdown tables
 escape_markdown() {
-    printf '%s' "$1" | tr -d '\n\r' | sed 's/|/\\|/g'
+    printf '%s' "$1" | tr -d '\n\r' | sed 's/\[/\\[/g; s/\]/\\]/g; s/|/\\|/g'
 }
 
-# Cross-platform sed in-place edit
-sed_inplace() {
-    if [[ "$(uname)" == "Darwin" ]]; then
-        sed -i '' "$@"
-    else
-        sed -i "$@"
-    fi
-}
-
-# Default date range
 FROM_DATE=$(date_days_ago 7)
 TO_DATE=$(date +%Y-%m-%d)
 DRY_RUN=false
 
-# Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         --org) GITHUB_ORG="$2"; shift 2 ;;
@@ -66,17 +54,18 @@ while [[ $# -gt 0 ]]; do
             cat << 'HELP'
 Usage: pr-log-sync.sh --org ORGANIZATION [OPTIONS]
 
-Fetches your GitHub PRs and code reviews, then updates Obsidian markdown files.
+Syncs GitHub PRs and code reviews to monthly Obsidian markdown files.
+Each entry is filed into the month matching its date.
 
 Required:
-  --org ORG        GitHub organization name (or set GITHUB_ORG env var)
+  --org ORG        GitHub organization (or set GITHUB_ORG env var)
 
 Options:
   --vault PATH     Obsidian vault PR Log path (default: ~/Documents/Obsidian Vault/YEAR/Work/PR Log)
-  --from DATE      Start date in YYYY-MM-DD format (default: 7 days ago)
-  --to DATE        End date in YYYY-MM-DD format (default: today)
-  --dry-run        Preview changes without writing files
-  -h, --help       Show this help message
+  --from DATE      Start date YYYY-MM-DD (default: 7 days ago)
+  --to DATE        End date YYYY-MM-DD (default: today)
+  --dry-run        Preview without writing files
+  -h, --help       Show this help
 
 Environment variables:
   GITHUB_ORG       GitHub organization (alternative to --org)
@@ -84,7 +73,7 @@ Environment variables:
 
 Examples:
   pr-log-sync.sh --org mycompany
-  pr-log-sync.sh --org mycompany --from 2024-01-01 --to 2024-01-31
+  pr-log-sync.sh --org mycompany --from 2026-01-01 --to 2026-01-31
   GITHUB_ORG=mycompany pr-log-sync.sh --dry-run
 HELP
             exit 0
@@ -93,50 +82,47 @@ HELP
     esac
 done
 
-# Validate required parameters
-if [[ -z "$GITHUB_ORG" ]]; then
-    echo "Error: GitHub organization required. Use --org or set GITHUB_ORG env var."
-    exit 1
-fi
+[[ -z "$GITHUB_ORG" ]] && { echo "Error: GitHub organization required. Use --org or set GITHUB_ORG env var."; exit 1; }
 
-# Ensure vault path exists
 mkdir -p "$VAULT_PATH"
 
-echo "PR Log Sync"
-echo "Date range: $FROM_DATE to $TO_DATE"
+echo "PR Log Sync: $FROM_DATE to $TO_DATE"
 [[ "$DRY_RUN" = true ]] && echo "DRY RUN - no files will be modified"
-echo ""
+echo
 
-# Fetch merged PRs
-echo "Fetching your PRs..."
+MY_LOGIN=$(gh api user --jq '.login' 2>/dev/null || echo "")
+if [[ -n "$MY_LOGIN" ]]; then
+    NOT_SELF='| select(.author.login != "'"$MY_LOGIN"'")'
+else
+    NOT_SELF=""
+fi
+
+echo "Fetching PRs and reviews..."
+
 MERGED_PRS=$(gh search prs --author=@me --owner="$GITHUB_ORG" --merged --merged-at="${FROM_DATE}..${TO_DATE}" \
     --limit=100 --json repository,title,url,closedAt \
     --jq '.[] | {repo: .repository.name, title: .title, url: .url, date: (.closedAt | split("T")[0]), status: "merged"}' 2>/dev/null || echo "")
 
-# Fetch closed (not merged) PRs
 CLOSED_PRS=$(gh search prs --author=@me --owner="$GITHUB_ORG" --state=closed --closed="${FROM_DATE}..${TO_DATE}" \
     --limit=100 --json repository,title,url,closedAt,state \
     --jq '.[] | select(.state != "merged") | {repo: .repository.name, title: .title, url: .url, date: (.closedAt | split("T")[0]), status: "closed"}' 2>/dev/null || echo "")
 
-# Fetch open PRs (created within date range)
 OPEN_PRS=$(gh search prs --author=@me --owner="$GITHUB_ORG" --state=open --created="${FROM_DATE}..${TO_DATE}" \
     --limit=100 --json repository,title,url,createdAt \
     --jq '.[] | {repo: .repository.name, title: .title, url: .url, date: (.createdAt | split("T")[0]), status: "open"}' 2>/dev/null || echo "")
 
-# Fetch PR updates (PRs updated in date range but created before it - to track ongoing work)
-UPDATED_PRS_RAW=$(gh search prs --author=@me --owner="$GITHUB_ORG" --state=open --updated="${FROM_DATE}..${TO_DATE}" \
+# Only include PRs created before the date range (already-open work that's still active)
+UPDATED_PRS=$(gh search prs --author=@me --owner="$GITHUB_ORG" --state=open --updated="${FROM_DATE}..${TO_DATE}" \
     --limit=100 --json repository,title,url,updatedAt,createdAt \
-    --jq '.[] | {repo: .repository.name, title: .title, url: .url, date: (.updatedAt | split("T")[0]), created: (.createdAt | split("T")[0])}' 2>/dev/null || echo "")
+    --jq '.[] | select((.createdAt | split("T")[0]) < "'"$FROM_DATE"'") | {repo: .repository.name, title: .title, url: .url, date: (.updatedAt | split("T")[0])}' 2>/dev/null || echo "")
 
-# Filter out PRs created within the date range (those are already captured as new PRs)
-UPDATED_PRS=$(echo "$UPDATED_PRS_RAW" | while IFS= read -r line; do
-    [[ -z "$line" || "$line" != "{"* ]] && continue
-    created=$(echo "$line" | jq -r '.created // empty')
-    # Only include if created before the FROM_DATE
-    if [[ -n "$created" && "$created" < "$FROM_DATE" ]]; then
-        echo "$line"
-    fi
-done)
+REVIEWED_PRS=$(gh search prs --reviewed-by=@me --owner="$GITHUB_ORG" --merged --merged-at="${FROM_DATE}..${TO_DATE}" \
+    --limit=100 --json repository,title,url,closedAt,author \
+    --jq '.[] '"$NOT_SELF"' | {repo: .repository.name, title: .title, url: .url, date: (.closedAt | split("T")[0]), author: .author.login}' 2>/dev/null || echo "")
+
+PENDING_REVIEWS=$(gh search prs --reviewed-by=@me --owner="$GITHUB_ORG" --state=open --updated="${FROM_DATE}..${TO_DATE}" \
+    --limit=100 --json repository,title,url,updatedAt,author \
+    --jq '.[] '"$NOT_SELF"' | {repo: .repository.name, title: .title, url: .url, date: (.updatedAt | split("T")[0]), author: .author.login}' 2>/dev/null || echo "")
 
 ALL_PRS="${MERGED_PRS}
 ${CLOSED_PRS}
@@ -146,168 +132,66 @@ merged_count=$(echo "$MERGED_PRS" | grep -c '"status"' || true)
 closed_count=$(echo "$CLOSED_PRS" | grep -c '"status"' || true)
 open_count=$(echo "$OPEN_PRS" | grep -c '"status"' || true)
 updated_count=$(echo "$UPDATED_PRS" | grep -c '"repo"' || true)
-echo "  Found $merged_count merged, $closed_count closed, $open_count open PRs, and $updated_count PR updates"
-
-# Fetch code reviews (PRs you reviewed but didn't author)
-echo "Fetching your code reviews..."
-REVIEWED_PRS=$(gh search prs --reviewed-by=@me --owner="$GITHUB_ORG" --merged --merged-at="${FROM_DATE}..${TO_DATE}" \
-    --limit=100 --json repository,title,url,closedAt,author \
-    --jq '.[] | {repo: .repository.name, title: .title, url: .url, date: (.closedAt | split("T")[0]), author: .author.login}' 2>/dev/null || echo "")
-
-# Fetch pending reviews (open PRs you reviewed but didn't author, updated in date range)
-PENDING_REVIEWS_RAW=$(gh search prs --reviewed-by=@me --owner="$GITHUB_ORG" --state=open --updated="${FROM_DATE}..${TO_DATE}" \
-    --limit=100 --json repository,title,url,updatedAt,author \
-    --jq '.[] | {repo: .repository.name, title: .title, url: .url, date: (.updatedAt | split("T")[0]), author: .author.login}' 2>/dev/null || echo "")
-
-# Filter out PRs authored by self
-MY_LOGIN=$(gh api user --jq '.login' 2>/dev/null || echo "")
-if [[ -n "$MY_LOGIN" ]]; then
-    REVIEWED_PRS=$(echo "$REVIEWED_PRS" | while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        author=$(echo "$line" | jq -r '.author // empty')
-        [[ "$author" != "$MY_LOGIN" ]] && echo "$line" || true
-    done)
-    PENDING_REVIEWS=$(echo "$PENDING_REVIEWS_RAW" | while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        author=$(echo "$line" | jq -r '.author // empty')
-        [[ "$author" != "$MY_LOGIN" ]] && echo "$line" || true
-    done)
-else
-    PENDING_REVIEWS="$PENDING_REVIEWS_RAW"
-fi
-
 review_count=$(echo "$REVIEWED_PRS" | grep -c '"repo"' || true)
-pending_review_count=$(echo "$PENDING_REVIEWS" | grep -c '"repo"' || true)
-echo "  Found $review_count code reviews, $pending_review_count pending reviews"
-echo ""
+pending_count=$(echo "$PENDING_REVIEWS" | grep -c '"repo"' || true)
+echo "  $merged_count merged, $closed_count closed, $open_count open, $updated_count updates, $review_count reviews, $pending_count pending"
+for c in $merged_count $closed_count $open_count $updated_count $review_count $pending_count; do
+    [[ $c -ge 100 ]] && { echo "Warning: results may be truncated at 100. Narrow the date range with --from/--to."; break; }
+done
+echo
 
-# Process authored PRs
-echo "Processing your PRs..."
-while IFS= read -r pr_json; do
-    [[ -z "$pr_json" || "$pr_json" != "{"* ]] && continue
+# Each entry is filed into the month matching its own date.
+# For updates, allows same URL with different dates (tracks daily activity).
+process_entries() {
+    local data="$1" ext="$2" extra_field="${3:-}" extra_prefix="${4:-}"
 
-    repo=$(echo "$pr_json" | jq -r '.repo')
-    title=$(echo "$pr_json" | jq -r '.title')
-    url=$(echo "$pr_json" | jq -r '.url')
-    date=$(echo "$pr_json" | jq -r '.date')
-    status=$(echo "$pr_json" | jq -r '.status')
+    while IFS= read -r pr_json; do
+        [[ -z "$pr_json" || "$pr_json" != "{"* ]] && continue
 
-    [[ -z "$repo" || "$repo" = "null" ]] && continue
+        local repo title url date
+        repo=$(echo "$pr_json" | jq -r '.repo')
+        title=$(echo "$pr_json" | jq -r '.title')
+        url=$(echo "$pr_json" | jq -r '.url')
+        date=$(echo "$pr_json" | jq -r '.date')
+        [[ -z "$repo" || "$repo" = "null" ]] && continue
 
-    month_file=$(get_month_file "$date")
-    full_path="$VAULT_PATH/$month_file"
+        local month_file full_path
+        month_file=$(month_file_for_date "$date")
+        full_path="$VAULT_PATH/$month_file"
 
-    # Skip if URL already exists in file
-    [[ -f "$full_path" ]] && grep -qF "$url" "$full_path" && { echo "  Skipping (exists): $title"; continue; }
-
-    title=$(escape_markdown "$title")
-    pr_row="| $date | $repo | [$title]($url) | $status |"
-    echo "  + $repo: $title"
-    echo "$pr_row" >> "$TEMP_DIR/${month_file}.prs"
-done <<< "$ALL_PRS"
-
-# Process code reviews
-echo ""
-echo "Processing code reviews..."
-while IFS= read -r pr_json; do
-    [[ -z "$pr_json" || "$pr_json" != "{"* ]] && continue
-
-    repo=$(echo "$pr_json" | jq -r '.repo')
-    title=$(echo "$pr_json" | jq -r '.title')
-    url=$(echo "$pr_json" | jq -r '.url')
-    date=$(echo "$pr_json" | jq -r '.date')
-    author=$(echo "$pr_json" | jq -r '.author')
-
-    [[ -z "$repo" || "$repo" = "null" ]] && continue
-
-    month_file=$(get_month_file "$date")
-    full_path="$VAULT_PATH/$month_file"
-
-    # Skip if URL already exists in file
-    [[ -f "$full_path" ]] && grep -qF "$url" "$full_path" && { echo "  Skipping (exists): $title"; continue; }
-
-    title=$(escape_markdown "$title")
-    review_row="| $date | $repo | [$title]($url) | @$author |"
-    echo "  + reviewed $repo: $title (by @$author)"
-    echo "$review_row" >> "$TEMP_DIR/${month_file}.reviews"
-done <<< "$REVIEWED_PRS"
-
-# Process PR updates
-echo ""
-echo "Processing PR updates..."
-while IFS= read -r pr_json; do
-    [[ -z "$pr_json" || "$pr_json" != "{"* ]] && continue
-
-    repo=$(echo "$pr_json" | jq -r '.repo')
-    title=$(echo "$pr_json" | jq -r '.title')
-    url=$(echo "$pr_json" | jq -r '.url')
-    date=$(echo "$pr_json" | jq -r '.date')
-
-    [[ -z "$repo" || "$repo" = "null" ]] && continue
-
-    month_file=$(get_month_file "$date")
-    full_path="$VAULT_PATH/$month_file"
-
-    # For updates, check if this specific date+URL combo exists on the same row (same PR can be updated multiple days)
-    if [[ -f "$full_path" ]]; then
-        # Extract PR Updates section and check for a row containing both date AND URL
-        if grep -A1000 "## PR Updates" "$full_path" 2>/dev/null | grep -B1000 "## Code Reviews" 2>/dev/null | grep -F "$date" | grep -qF "$url"; then
-            echo "  Skipping (exists): $title"
-            continue
+        if [[ -f "$full_path" ]]; then
+            if [[ "$ext" == "updates" ]]; then
+                grep -F "$url" "$full_path" | grep -qF "$date" && continue
+            else
+                grep -qF "$url" "$full_path" && continue
+            fi
         fi
-    fi
 
-    title=$(escape_markdown "$title")
-    update_row="| $date | $repo | [$title]($url) | Continued work |"
-    echo "  + updated $repo: $title"
-    echo "$update_row" >> "$TEMP_DIR/${month_file}.updates"
-done <<< "$UPDATED_PRS"
+        title=$(escape_markdown "$title")
+        local last_col
+        if [[ -n "$extra_field" ]]; then
+            last_col="${extra_prefix}$(echo "$pr_json" | jq -r ".$extra_field")"
+        else
+            last_col="$extra_prefix"
+        fi
 
-# Process pending reviews
-echo ""
-echo "Processing pending reviews..."
-while IFS= read -r pr_json; do
-    [[ -z "$pr_json" || "$pr_json" != "{"* ]] && continue
+        echo "| $date | $repo | [$title]($url) | $last_col |" >> "$TEMP_DIR/${month_file}.$ext"
+    done <<< "$data"
+}
 
-    repo=$(echo "$pr_json" | jq -r '.repo')
-    title=$(echo "$pr_json" | jq -r '.title')
-    url=$(echo "$pr_json" | jq -r '.url')
-    date=$(echo "$pr_json" | jq -r '.date')
-    author=$(echo "$pr_json" | jq -r '.author')
+echo "Processing..."
+process_entries "$ALL_PRS" "prs" "status" ""
+process_entries "$UPDATED_PRS" "updates" "" "Continued work"
+process_entries "$REVIEWED_PRS" "reviews" "author" "@"
+process_entries "$PENDING_REVIEWS" "pending" "author" "@"
 
-    [[ -z "$repo" || "$repo" = "null" ]] && continue
-
-    month_file=$(get_month_file "$date")
-    full_path="$VAULT_PATH/$month_file"
-
-    # Skip if URL already exists in file
-    [[ -f "$full_path" ]] && grep -qF "$url" "$full_path" && { echo "  Skipping (exists): $title"; continue; }
-
-    title=$(escape_markdown "$title")
-    pending_row="| $date | $repo | [$title]($url) | @$author |"
-    echo "  + pending review $repo: $title (by @$author)"
-    echo "$pending_row" >> "$TEMP_DIR/${month_file}.pending"
-done <<< "$PENDING_REVIEWS"
-
-echo ""
-
-# Check if any changes to make
 shopt -s nullglob
-pr_files=("$TEMP_DIR"/*.prs)
-review_files=("$TEMP_DIR"/*.reviews)
-update_files=("$TEMP_DIR"/*.updates)
-pending_files=("$TEMP_DIR"/*.pending)
+temp_files=("$TEMP_DIR"/*)
 shopt -u nullglob
+[[ ${#temp_files[@]} -eq 0 ]] && { echo "No new data to add"; exit 0; }
 
-if [[ ${#pr_files[@]} -eq 0 && ${#review_files[@]} -eq 0 && ${#update_files[@]} -eq 0 && ${#pending_files[@]} -eq 0 ]]; then
-    echo "No new PRs, updates, or reviews to add"
-    exit 0
-fi
-
-# Create file template
 create_month_file() {
-    local path="$1"
-    local month_name="$2"
+    local path="$1" month_name="$2"
     cat > "$path" << EOF
 [[PR Log]]
 
@@ -345,124 +229,77 @@ create_month_file() {
 | Date | Repo | Title | Author |
 |------|------|-------|--------|
 
-## Related Project Notes
+## Notes
 EOF
 }
 
-# Insert rows before a section marker
 insert_before_section() {
-    local file="$1"
-    local section="$2"
-    local content="$3"
-
-    if grep -qF "$section" "$file"; then
-        local line_num
-        line_num=$(grep -nF "$section" "$file" | head -1 | cut -d: -f1)
-        head -n $((line_num - 1)) "$file" > "${file}.tmp"
-        echo "$content" >> "${file}.tmp"
-        tail -n +"$line_num" "$file" >> "${file}.tmp"
-        mv "${file}.tmp" "$file"
+    local file="$1" section="$2" content="$3"
+    if ! grep -qF "$section" "$file"; then
+        echo "Warning: section '$section' not found in $(basename "$file") — skipping insert"
+        return 0
     fi
+    local line_num
+    line_num=$(grep -nF "$section" "$file" | head -1 | cut -d: -f1)
+    head -n $((line_num - 1)) "$file" > "${file}.tmp"
+    echo "$content" >> "${file}.tmp"
+    echo >> "${file}.tmp"
+    tail -n +"$line_num" "$file" >> "${file}.tmp"
+    mv "${file}.tmp" "$file"
 }
 
-# Update summary statistics in a month file
 update_summary() {
     local file="$1"
+    local merged closed open total pr_updates reviews pending_reviews
 
-    # Count PRs by status (last column in PR table rows)
-    local merged=$(grep -E '^\| [0-9]{4}-[0-9]{2}-[0-9]{2} \|.*\| merged \|$' "$file" | wc -l | tr -d ' ')
-    local closed=$(grep -E '^\| [0-9]{4}-[0-9]{2}-[0-9]{2} \|.*\| closed \|$' "$file" | wc -l | tr -d ' ')
-    local open=$(grep -E '^\| [0-9]{4}-[0-9]{2}-[0-9]{2} \|.*\| open \|$' "$file" | wc -l | tr -d ' ')
-    local total=$((merged + closed + open))
+    merged=$(grep -cE '^\| [0-9]{4}-[0-9]{2}-[0-9]{2} \|.*\| merged \|$' "$file" || true)
+    closed=$(grep -cE '^\| [0-9]{4}-[0-9]{2}-[0-9]{2} \|.*\| closed \|$' "$file" || true)
+    open=$(grep -cE '^\| [0-9]{4}-[0-9]{2}-[0-9]{2} \|.*\| open \|$' "$file" || true)
+    total=$((merged + closed + open))
+    pr_updates=$(grep -cE '^\| [0-9]{4}-[0-9]{2}-[0-9]{2} \|.*\| Continued work \|$' "$file" || true)
+    # Scope review counts to their sections to avoid cross-contamination
+    reviews=$(sed -n '/^## Code Reviews$/,/^## Pending Reviews$/p' "$file" | grep -cE '^\| [0-9]{4}-[0-9]{2}-[0-9]{2} \|.*\| @' || true)
+    pending_reviews=$(sed -n '/^## Pending Reviews$/,/^## Notes$/p' "$file" | grep -cE '^\| [0-9]{4}-[0-9]{2}-[0-9]{2} \|.*\| @' || true)
 
-    # Count PR updates (rows in PR Updates section - look for "Continued work" pattern)
-    local pr_updates=$(grep -E '^\| [0-9]{4}-[0-9]{2}-[0-9]{2} \|.*\| Continued work \|$' "$file" | wc -l | tr -d ' ')
-
-    # Count reviews (rows in Code Reviews section only - between "## Code Reviews" and "## Pending Reviews")
-    local reviews=$(sed -n '/^## Code Reviews$/,/^## Pending Reviews$/p' "$file" | grep -E '^\| [0-9]{4}-[0-9]{2}-[0-9]{2} \|.*\| @' | wc -l | tr -d ' ')
-
-    # Count pending reviews (rows in Pending Reviews section - between "## Pending Reviews" and "## Related Project Notes")
-    local pending_reviews=$(sed -n '/^## Pending Reviews$/,/^## Related Project Notes$/p' "$file" | grep -E '^\| [0-9]{4}-[0-9]{2}-[0-9]{2} \|.*\| @' | wc -l | tr -d ' ')
-
-    # Update the summary table using sed
-    sed_inplace "s/| \*\*Total PRs\*\* | [0-9]* |/| **Total PRs** | $total |/" "$file"
-    sed_inplace "s/| \*\*Merged\*\* | [0-9]* |/| **Merged** | $merged |/" "$file"
-    sed_inplace "s/| \*\*Closed\*\* | [0-9]* |/| **Closed** | $closed |/" "$file"
-    sed_inplace "s/| \*\*Open\*\* | [0-9]* |/| **Open** | $open |/" "$file"
-    sed_inplace "s/| \*\*PR Updates\*\* | [0-9]* |/| **PR Updates** | $pr_updates |/" "$file"
-    sed_inplace "s/| \*\*Reviews\*\* | [0-9]* |/| **Reviews** | $reviews |/" "$file"
-    sed_inplace "s/| \*\*Pending Reviews\*\* | [0-9]* |/| **Pending Reviews** | $pending_reviews |/" "$file"
+    "${SED_INPLACE[@]}" "s/| \*\*Total PRs\*\* | [0-9]* |/| **Total PRs** | $total |/" "$file"
+    "${SED_INPLACE[@]}" "s/| \*\*Merged\*\* | [0-9]* |/| **Merged** | $merged |/" "$file"
+    "${SED_INPLACE[@]}" "s/| \*\*Closed\*\* | [0-9]* |/| **Closed** | $closed |/" "$file"
+    "${SED_INPLACE[@]}" "s/| \*\*Open\*\* | [0-9]* |/| **Open** | $open |/" "$file"
+    "${SED_INPLACE[@]}" "s/| \*\*PR Updates\*\* | [0-9]* |/| **PR Updates** | $pr_updates |/" "$file"
+    "${SED_INPLACE[@]}" "s/| \*\*Reviews\*\* | [0-9]* |/| **Reviews** | $reviews |/" "$file"
+    "${SED_INPLACE[@]}" "s/| \*\*Pending Reviews\*\* | [0-9]* |/| **Pending Reviews** | $pending_reviews |/" "$file"
 }
 
 if [[ "$DRY_RUN" = true ]]; then
     echo "DRY RUN - Changes that would be made:"
-    for pr_file in "$TEMP_DIR"/*.prs; do
-        [[ -f "$pr_file" ]] || continue
-        echo ""
-        echo "$(basename "$pr_file" .prs) - PRs:"
-        cat "$pr_file"
-    done
-    for update_file in "$TEMP_DIR"/*.updates; do
-        [[ -f "$update_file" ]] || continue
-        echo ""
-        echo "$(basename "$update_file" .updates) - PR Updates:"
-        cat "$update_file"
-    done
-    for review_file in "$TEMP_DIR"/*.reviews; do
-        [[ -f "$review_file" ]] || continue
-        echo ""
-        echo "$(basename "$review_file" .reviews) - Reviews:"
-        cat "$review_file"
-    done
-    for pending_file in "$TEMP_DIR"/*.pending; do
-        [[ -f "$pending_file" ]] || continue
-        echo ""
-        echo "$(basename "$pending_file" .pending) - Pending Reviews:"
-        cat "$pending_file"
+    for f in "$TEMP_DIR"/*; do
+        [[ -f "$f" ]] || continue
+        echo
+        echo "$(basename "$f"):"
+        cat "$f"
     done
 else
-    # Get unique months (use nullglob to handle missing file types)
-    shopt -s nullglob
-    all_temp_files=("$TEMP_DIR"/*.prs "$TEMP_DIR"/*.updates "$TEMP_DIR"/*.reviews "$TEMP_DIR"/*.pending)
-    shopt -u nullglob
-    months=$(printf '%s\n' "${all_temp_files[@]}" | xargs -n1 basename 2>/dev/null | sed -E 's/\.(prs|updates|reviews|pending)$//' | sort -u)
+    months=()
+    while IFS= read -r m; do months+=("$m"); done < <(printf '%s\n' "${temp_files[@]}" | xargs -n1 basename | sed -E 's/\.(prs|updates|reviews|pending)$//' | sort -u)
 
-    for month_file in $months; do
+    for month_file in "${months[@]}"; do
         full_path="$VAULT_PATH/$month_file"
 
-        # Create file if needed
         if [[ ! -f "$full_path" ]]; then
-            month_name=$(echo "$month_file" | sed 's/[0-9]*-//' | sed 's/.md//')
+            month_name=$(echo "$month_file" | sed -E 's/^[0-9]+-//; s/\.md$//')
             echo "Creating: $month_file"
             create_month_file "$full_path" "$month_name"
         fi
 
-        # Insert PRs before PR Updates section
-        if [[ -f "$TEMP_DIR/${month_file}.prs" ]]; then
-            insert_before_section "$full_path" "## PR Updates" "$(cat "$TEMP_DIR/${month_file}.prs")"
-        fi
+        [[ -f "$TEMP_DIR/${month_file}.prs" ]]     && insert_before_section "$full_path" "## PR Updates" "$(cat "$TEMP_DIR/${month_file}.prs")"
+        [[ -f "$TEMP_DIR/${month_file}.updates" ]]  && insert_before_section "$full_path" "## Code Reviews" "$(cat "$TEMP_DIR/${month_file}.updates")"
+        [[ -f "$TEMP_DIR/${month_file}.reviews" ]]  && insert_before_section "$full_path" "## Pending Reviews" "$(cat "$TEMP_DIR/${month_file}.reviews")"
+        [[ -f "$TEMP_DIR/${month_file}.pending" ]]  && insert_before_section "$full_path" "## Notes" "$(cat "$TEMP_DIR/${month_file}.pending")"
 
-        # Insert PR updates before Code Reviews section
-        if [[ -f "$TEMP_DIR/${month_file}.updates" ]]; then
-            insert_before_section "$full_path" "## Code Reviews" "$(cat "$TEMP_DIR/${month_file}.updates")"
-        fi
-
-        # Insert reviews before Pending Reviews section
-        if [[ -f "$TEMP_DIR/${month_file}.reviews" ]]; then
-            insert_before_section "$full_path" "## Pending Reviews" "$(cat "$TEMP_DIR/${month_file}.reviews")"
-        fi
-
-        # Insert pending reviews before Related Project Notes section
-        if [[ -f "$TEMP_DIR/${month_file}.pending" ]]; then
-            insert_before_section "$full_path" "## Related Project Notes" "$(cat "$TEMP_DIR/${month_file}.pending")"
-        fi
-
-        # Update summary statistics
         update_summary "$full_path"
-
         echo "Updated: $month_file"
     done
 fi
 
-echo ""
+echo
 echo "Done!"
